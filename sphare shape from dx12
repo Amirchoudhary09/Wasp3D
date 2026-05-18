@@ -1,0 +1,1064 @@
+// ============================================================
+// DX12 REALISTIC SPHERE
+// SINGLE FILE
+// ============================================================
+
+#include <windows.h>
+#include <wrl/client.h>
+
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <d3dcompiler.h>
+
+#include <DirectXMath.h>
+
+#include <vector>
+
+#pragma comment(lib,"d3d12.lib")
+#pragma comment(lib,"dxgi.lib")
+#pragma comment(lib,"d3dcompiler.lib")
+
+using namespace Microsoft::WRL;
+using namespace DirectX;
+using namespace std;
+
+// ============================================================
+// STRUCTS
+// ============================================================
+
+struct Vertex
+{
+    XMFLOAT3 pos;
+
+    XMFLOAT3 color;
+
+    XMFLOAT3 normal;
+};
+
+struct ConstantBuffer
+{
+    XMMATRIX world;
+
+    XMMATRIX view;
+
+    XMMATRIX projection;
+};
+
+// ============================================================
+// WINDOW PROC
+// ============================================================
+
+LRESULT CALLBACK WndProc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM lParam)
+{
+    if (msg == WM_DESTROY)
+    {
+        PostQuitMessage(0);
+
+        return 0;
+    }
+
+    return DefWindowProc(
+        hwnd,
+        msg,
+        wParam,
+        lParam);
+}
+
+// ============================================================
+// GLOBALS
+// ============================================================
+
+HWND hwnd = nullptr;
+
+UINT width = 1280;
+
+UINT height = 720;
+
+ComPtr<ID3D12Device> device;
+
+ComPtr<IDXGISwapChain3> swapChain;
+
+ComPtr<ID3D12CommandQueue> commandQueue;
+
+ComPtr<ID3D12DescriptorHeap> rtvHeap;
+
+ComPtr<ID3D12Resource> renderTargets[2];
+
+ComPtr<ID3D12CommandAllocator> commandAllocator;
+
+ComPtr<ID3D12GraphicsCommandList> commandList;
+
+ComPtr<ID3D12Fence> fence;
+
+UINT64 fenceValue = 0;
+
+HANDLE fenceEvent = nullptr;
+
+UINT frameIndex = 0;
+
+UINT rtvDescriptorSize = 0;
+
+ComPtr<ID3D12RootSignature> rootSignature;
+
+ComPtr<ID3D12PipelineState> pipelineState;
+
+ComPtr<ID3D12Resource> vertexBuffer;
+
+ComPtr<ID3D12Resource> indexBuffer;
+
+ComPtr<ID3D12Resource> constantBuffer;
+
+D3D12_VERTEX_BUFFER_VIEW vbView = {};
+
+D3D12_INDEX_BUFFER_VIEW ibView = {};
+
+UINT8* cbvDataBegin = nullptr;
+
+float angle = 0.0f;
+
+vector<Vertex> vertices;
+
+vector<UINT> indices;
+
+// ============================================================
+// WAIT GPU
+// ============================================================
+
+void WaitForGPU()
+{
+    fenceValue++;
+
+    commandQueue->Signal(
+        fence.Get(),
+        fenceValue);
+
+    if (fence->GetCompletedValue() < fenceValue)
+    {
+        fence->SetEventOnCompletion(
+            fenceValue,
+            fenceEvent);
+
+        WaitForSingleObject(
+            fenceEvent,
+            INFINITE);
+    }
+
+    frameIndex =
+        swapChain->GetCurrentBackBufferIndex();
+}
+
+// ============================================================
+// WINDOW
+// ============================================================
+
+void InitWindow(HINSTANCE hInstance)
+{
+    WNDCLASS wc = {};
+
+    wc.lpfnWndProc =
+        WndProc;
+
+    wc.hInstance =
+        hInstance;
+
+    wc.lpszClassName =
+        L"DX12Window";
+
+    RegisterClass(&wc);
+
+    hwnd = CreateWindowEx(
+        0,
+        L"DX12Window",
+        L"DX12 Sphere",
+        WS_OVERLAPPEDWINDOW,
+        100,
+        100,
+        width,
+        height,
+        nullptr,
+        nullptr,
+        hInstance,
+        nullptr);
+
+    ShowWindow(hwnd, SW_SHOW);
+}
+
+// ============================================================
+// D3D
+// ============================================================
+
+void InitD3D()
+{
+    // FACTORY
+
+    ComPtr<IDXGIFactory4> factory;
+
+    CreateDXGIFactory1(
+        IID_PPV_ARGS(&factory));
+
+    // DEVICE
+
+    D3D12CreateDevice(
+        nullptr,
+        D3D_FEATURE_LEVEL_11_0,
+        IID_PPV_ARGS(&device));
+
+    // QUEUE
+
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+
+    device->CreateCommandQueue(
+        &queueDesc,
+        IID_PPV_ARGS(&commandQueue));
+
+    // SWAPCHAIN
+
+    DXGI_SWAP_CHAIN_DESC1 swapDesc = {};
+
+    swapDesc.BufferCount = 2;
+
+    swapDesc.Width = width;
+
+    swapDesc.Height = height;
+
+    swapDesc.Format =
+        DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    swapDesc.BufferUsage =
+        DXGI_USAGE_RENDER_TARGET_OUTPUT;
+
+    swapDesc.SwapEffect =
+        DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+    swapDesc.SampleDesc.Count = 1;
+
+    ComPtr<IDXGISwapChain1> tempSwapChain;
+
+    factory->CreateSwapChainForHwnd(
+        commandQueue.Get(),
+        hwnd,
+        &swapDesc,
+        nullptr,
+        nullptr,
+        &tempSwapChain);
+
+    tempSwapChain.As(&swapChain);
+
+    frameIndex =
+        swapChain->GetCurrentBackBufferIndex();
+
+    // RTV
+
+    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = {};
+
+    rtvDesc.NumDescriptors = 2;
+
+    rtvDesc.Type =
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+
+    device->CreateDescriptorHeap(
+        &rtvDesc,
+        IID_PPV_ARGS(&rtvHeap));
+
+    rtvDescriptorSize =
+        device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle =
+        rtvHeap->GetCPUDescriptorHandleForHeapStart();
+
+    for (UINT i = 0; i < 2; i++)
+    {
+        swapChain->GetBuffer(
+            i,
+            IID_PPV_ARGS(&renderTargets[i]));
+
+        device->CreateRenderTargetView(
+            renderTargets[i].Get(),
+            nullptr,
+            rtvHandle);
+
+        rtvHandle.ptr +=
+            rtvDescriptorSize;
+    }
+
+    // COMMANDS
+
+    device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(&commandAllocator));
+
+    device->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        commandAllocator.Get(),
+        nullptr,
+        IID_PPV_ARGS(&commandList));
+
+    commandList->Close();
+
+    // ROOT SIGNATURE
+
+    D3D12_ROOT_PARAMETER rootParam = {};
+
+    rootParam.ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_CBV;
+
+    rootParam.Descriptor.ShaderRegister = 0;
+
+    rootParam.ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
+
+    rootSigDesc.NumParameters = 1;
+
+    rootSigDesc.pParameters =
+        &rootParam;
+
+    rootSigDesc.Flags =
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> sigBlob;
+
+    ComPtr<ID3DBlob> errorBlob;
+
+    D3D12SerializeRootSignature(
+        &rootSigDesc,
+        D3D_ROOT_SIGNATURE_VERSION_1,
+        &sigBlob,
+        &errorBlob);
+
+    device->CreateRootSignature(
+        0,
+        sigBlob->GetBufferPointer(),
+        sigBlob->GetBufferSize(),
+        IID_PPV_ARGS(&rootSignature));
+
+    // ============================================================
+    // SHADER
+    // ============================================================
+
+    const char* shader = R"(
+
+cbuffer CB : register(b0)
+{
+    float4x4 world;
+
+    float4x4 view;
+
+    float4x4 projection;
+};
+
+struct VSInput
+{
+    float3 pos : POSITION;
+
+    float3 color : COLOR;
+
+    float3 normal : NORMAL;
+};
+
+struct PSInput
+{
+    float4 pos : SV_POSITION;
+
+    float3 color : COLOR;
+
+    float3 normal : NORMAL;
+};
+
+PSInput VSMain(VSInput input)
+{
+    PSInput output;
+
+    float4 worldPos =
+        mul(float4(input.pos,1),world);
+
+    float4 viewPos =
+        mul(worldPos,view);
+
+    output.pos =
+        mul(viewPos,projection);
+
+    output.color =
+        input.color;
+
+    output.normal =
+        normalize(
+            mul(float4(input.normal,0),world).xyz);
+
+    return output;
+}
+
+float4 PSMain(PSInput input)
+    : SV_TARGET
+{
+    float3 lightDir =
+        normalize(float3(1,1,-1));
+
+    float diffuse =
+        max(
+            dot(
+                normalize(input.normal),
+                lightDir),
+            0.0f);
+
+    float ambient = 0.2f;
+
+    float3 finalColor =
+        input.color *
+        (diffuse + ambient);
+
+    return float4(finalColor,1);
+}
+
+)";
+
+    ComPtr<ID3DBlob> vsBlob;
+
+    ComPtr<ID3DBlob> psBlob;
+
+    D3DCompile(
+        shader,
+        strlen(shader),
+        nullptr,
+        nullptr,
+        nullptr,
+        "VSMain",
+        "vs_5_0",
+        0,
+        0,
+        &vsBlob,
+        nullptr);
+
+    D3DCompile(
+        shader,
+        strlen(shader),
+        nullptr,
+        nullptr,
+        nullptr,
+        "PSMain",
+        "ps_5_0",
+        0,
+        0,
+        &psBlob,
+        nullptr);
+
+    // INPUT LAYOUT
+
+    D3D12_INPUT_ELEMENT_DESC inputLayout[] =
+    {
+        {
+            "POSITION",
+            0,
+            DXGI_FORMAT_R32G32B32_FLOAT,
+            0,
+            0,
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0
+        },
+
+        {
+            "COLOR",
+            0,
+            DXGI_FORMAT_R32G32B32_FLOAT,
+            0,
+            12,
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0
+        },
+
+        {
+            "NORMAL",
+            0,
+            DXGI_FORMAT_R32G32B32_FLOAT,
+            0,
+            24,
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0
+        }
+    };
+
+    // PSO
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+
+    psoDesc.InputLayout =
+    {
+        inputLayout,
+        3
+    };
+
+    psoDesc.pRootSignature =
+        rootSignature.Get();
+
+    psoDesc.VS =
+    {
+        vsBlob->GetBufferPointer(),
+        vsBlob->GetBufferSize()
+    };
+
+    psoDesc.PS =
+    {
+        psBlob->GetBufferPointer(),
+        psBlob->GetBufferSize()
+    };
+
+    psoDesc.RasterizerState.FillMode =
+        D3D12_FILL_MODE_SOLID;
+
+    psoDesc.RasterizerState.CullMode =
+        D3D12_CULL_MODE_BACK;
+
+    psoDesc.RasterizerState.DepthClipEnable =
+        TRUE;
+
+    psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    psoDesc.DepthStencilState.DepthEnable =
+        FALSE;
+
+    psoDesc.DepthStencilState.StencilEnable =
+        FALSE;
+
+    psoDesc.SampleMask =
+        UINT_MAX;
+
+    psoDesc.PrimitiveTopologyType =
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+    psoDesc.NumRenderTargets = 1;
+
+    psoDesc.RTVFormats[0] =
+        DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    psoDesc.SampleDesc.Count = 1;
+
+    device->CreateGraphicsPipelineState(
+        &psoDesc,
+        IID_PPV_ARGS(&pipelineState));
+
+    // ============================================================
+    // SPHERE
+    // ============================================================
+
+    float radius = 0.5f;
+
+    int stackCount = 100;
+
+    int sliceCount = 100;
+
+    for (int stack = 0;stack <= stackCount; stack++){
+        float phi =
+            XM_PI * stack / stackCount;
+
+        for (int slice = 0;slice <= sliceCount; slice++) {
+            float theta =
+                XM_2PI * slice / sliceCount;
+
+            float x =
+                radius *
+                sinf(phi) *
+                cosf(theta);
+
+            float y =
+                radius *
+                cosf(phi);
+
+            float z =
+                radius *
+                sinf(phi) *
+                sinf(theta);
+
+            Vertex v;
+
+            v.pos =
+            {
+                x,
+                y,
+                z
+            };
+
+            v.color =
+            {
+                1,
+                0.5f,
+                1
+            };
+
+            v.normal =
+            {
+                x,
+                y,
+                z
+            };
+
+            vertices.push_back(v);
+        }
+    }
+    for (int stack = 0;
+        stack < stackCount;
+        stack++)
+    {
+        for (int slice = 0;
+            slice < sliceCount;
+            slice++)
+        {
+            int first =
+                stack * (sliceCount + 1)
+                + slice;
+
+            int second =
+                first + sliceCount + 1;
+
+            indices.push_back(first);
+
+            indices.push_back(second);
+			vertices[first].color = { 1,0,0 };
+			vertices[second].color = { 0,1,0 };
+
+            indices.push_back(first + 1);
+
+            indices.push_back(second);
+
+            indices.push_back(second + 1);
+
+            indices.push_back(first + 1);
+			vertices[first + 1].color = { 0,0,1 };
+			vertices[second + 1].color = { 1,1,0 };
+        }
+    }
+
+    // ============================================================
+    // VB
+    // ============================================================
+
+    UINT vbSize =
+        (UINT)(
+            vertices.size() *
+            sizeof(Vertex));
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+
+    heapProps.Type =
+        D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC vbDesc = {};
+
+    vbDesc.Dimension =
+        D3D12_RESOURCE_DIMENSION_BUFFER;
+
+    vbDesc.Width =
+        vbSize;
+
+    vbDesc.Height = 1;
+
+    vbDesc.DepthOrArraySize = 1;
+
+    vbDesc.MipLevels = 1;
+
+    vbDesc.SampleDesc.Count = 1;
+
+    vbDesc.Layout =
+        D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &vbDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&vertexBuffer));
+
+    UINT8* vbData = nullptr;
+
+    vertexBuffer->Map(
+        0,
+        nullptr,
+        reinterpret_cast<void**>(&vbData));
+
+    memcpy(
+        vbData,
+        vertices.data(),
+        vbSize);
+
+    vertexBuffer->Unmap(
+        0,
+        nullptr);
+
+    vbView.BufferLocation =
+        vertexBuffer->GetGPUVirtualAddress();
+
+    vbView.SizeInBytes =
+        vbSize;
+
+    vbView.StrideInBytes =
+        sizeof(Vertex);
+
+    // ============================================================
+    // IB
+    // ============================================================
+
+    UINT ibSize =
+        (UINT)(
+            indices.size() *
+            sizeof(UINT));
+
+    D3D12_RESOURCE_DESC ibDesc = {};
+
+    ibDesc.Dimension =
+        D3D12_RESOURCE_DIMENSION_BUFFER;
+
+    ibDesc.Width =
+        ibSize;
+
+    ibDesc.Height = 1;
+
+    ibDesc.DepthOrArraySize = 1;
+
+    ibDesc.MipLevels = 1;
+
+    ibDesc.SampleDesc.Count = 1;
+
+    ibDesc.Layout =
+        D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &ibDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&indexBuffer));
+
+    UINT8* ibData = nullptr;
+
+    indexBuffer->Map(
+        0,
+        nullptr,
+        reinterpret_cast<void**>(&ibData));
+
+    memcpy(
+        ibData,
+        indices.data(),
+        ibSize);
+
+    indexBuffer->Unmap(
+        0,
+        nullptr);
+
+    ibView.BufferLocation =
+        indexBuffer->GetGPUVirtualAddress();
+
+    ibView.SizeInBytes =
+        ibSize;
+
+    ibView.Format =
+        DXGI_FORMAT_R32_UINT;
+
+    // ============================================================
+    // CB
+    // ============================================================
+
+    UINT cbSize =
+        (sizeof(ConstantBuffer) + 255) & ~255;
+
+    D3D12_RESOURCE_DESC cbDesc = {};
+
+    cbDesc.Dimension =
+        D3D12_RESOURCE_DIMENSION_BUFFER;
+
+    cbDesc.Width =
+        cbSize;
+
+    cbDesc.Height = 1;
+
+    cbDesc.DepthOrArraySize = 1;
+
+    cbDesc.MipLevels = 1;
+
+    cbDesc.SampleDesc.Count = 1;
+
+    cbDesc.Layout =
+        D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &cbDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&constantBuffer));
+
+    constantBuffer->Map(
+        0,
+        nullptr,
+        reinterpret_cast<void**>(&cbvDataBegin));
+
+    // FENCE
+
+    device->CreateFence(
+        0,
+        D3D12_FENCE_FLAG_NONE,
+        IID_PPV_ARGS(&fence));
+
+    fenceEvent =
+        CreateEvent(
+            nullptr,
+            FALSE,
+            FALSE,
+            nullptr);
+}
+
+// ============================================================
+// UPDATE
+// ============================================================
+
+void Update()
+{
+    angle += 0.01f;
+
+    XMMATRIX world =
+        XMMatrixRotationRollPitchYaw(
+            0,
+            angle,
+            0);
+
+    XMVECTOR eye =
+        XMVectorSet(
+            0,
+            0,
+            -3,
+            1);
+
+    XMVECTOR target =
+        XMVectorSet(
+            0,
+            0,
+            0,
+            1);
+
+    XMVECTOR up =
+        XMVectorSet(
+            0,
+            1,
+            0,
+            0);
+
+    XMMATRIX view =
+        XMMatrixLookAtLH(
+            eye,
+            target,
+            up);
+
+    XMMATRIX projection =
+        XMMatrixPerspectiveFovLH(
+            XMConvertToRadians(45.0f),
+            (float)width / height,
+            0.1f,
+            100.0f);
+
+    ConstantBuffer cb;
+
+    cb.world =
+        XMMatrixTranspose(world);
+
+    cb.view =
+        XMMatrixTranspose(view);
+
+    cb.projection =
+        XMMatrixTranspose(projection);
+
+    memcpy(
+        cbvDataBegin,
+        &cb,
+        sizeof(cb));
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+
+void Render()
+{
+    commandAllocator->Reset();
+
+    commandList->Reset(
+        commandAllocator.Get(),
+        pipelineState.Get());
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+
+    barrier.Type =
+        D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+
+    barrier.Transition.pResource =
+        renderTargets[frameIndex].Get();
+
+    barrier.Transition.StateBefore =
+        D3D12_RESOURCE_STATE_PRESENT;
+
+    barrier.Transition.StateAfter =
+        D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+    barrier.Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    commandList->ResourceBarrier(
+        1,
+        &barrier);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle =
+        rtvHeap->GetCPUDescriptorHandleForHeapStart();
+
+    rtvHandle.ptr +=
+        frameIndex * rtvDescriptorSize;
+
+    commandList->OMSetRenderTargets(
+        1,
+        &rtvHandle,
+        FALSE,
+        nullptr);
+
+    FLOAT clearColor[] =
+    {
+        0.05f,
+        0.05f,
+        0.08f,
+        1.0f
+    };
+
+    commandList->ClearRenderTargetView(
+        rtvHandle,
+        clearColor,
+        0,
+        nullptr);
+
+    D3D12_VIEWPORT viewport =
+    {
+        0,
+        0,
+        (float)width,
+        (float)height,
+        0,
+        1
+    };
+
+    commandList->RSSetViewports(
+        1,
+        &viewport);
+
+    D3D12_RECT scissor =
+    {
+        0,
+        0,
+        (LONG)width,
+        (LONG)height
+    };
+
+    commandList->RSSetScissorRects(
+        1,
+        &scissor);
+
+    commandList->SetGraphicsRootSignature(
+        rootSignature.Get());
+
+    commandList->SetGraphicsRootConstantBufferView(
+        0,
+        constantBuffer->GetGPUVirtualAddress());
+
+    commandList->IASetPrimitiveTopology(
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    commandList->IASetVertexBuffers(
+        0,
+        1,
+        &vbView);
+
+    commandList->IASetIndexBuffer(
+        &ibView);
+
+    commandList->DrawIndexedInstanced(
+        (UINT)indices.size(),
+        1,
+        0,
+        0,
+        0);
+
+    barrier.Transition.StateBefore =
+        D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+    barrier.Transition.StateAfter =
+        D3D12_RESOURCE_STATE_PRESENT;
+
+    commandList->ResourceBarrier(
+        1,
+        &barrier);
+
+    commandList->Close();
+
+    ID3D12CommandList* lists[] =
+    {
+        commandList.Get()
+    };
+
+    commandQueue->ExecuteCommandLists(
+        1,
+        lists);
+
+    swapChain->Present(
+        1,
+        0);
+
+    WaitForGPU();
+}
+
+// ============================================================
+// WINMAIN
+// ============================================================
+
+int WINAPI WinMain(
+    HINSTANCE hInstance,
+    HINSTANCE,
+    LPSTR,
+    int)
+{
+    InitWindow(hInstance);
+
+    InitD3D();
+
+    MSG msg = {};
+
+    while (msg.message != WM_QUIT)
+    {
+        if (PeekMessage(
+            &msg,
+            nullptr,
+            0,
+            0,
+            PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+
+            DispatchMessage(&msg);
+        }
+        else
+        {
+            Update();
+
+            Render();
+        }
+    }
+
+    WaitForGPU();
+
+    CloseHandle(fenceEvent);
+
+    return 0;
+}
